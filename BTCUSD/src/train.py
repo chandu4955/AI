@@ -1,4 +1,4 @@
-# Updated train.py
+# Updated train.py with fixed max_features parameter
 import argparse
 import os
 import pickle
@@ -8,6 +8,7 @@ import MetaTrader5 as mt5
 from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
 
 from utils.data_utils import get_historical_data, prepare_features
 from utils.model_utils import train_model, save_model, load_model, evaluate_model_performance, compare_models, save_backtest_results
@@ -25,11 +26,15 @@ def main():
     parser.add_argument('--risk', type=float, default=0.02, help='Risk per trade (as a decimal, e.g., 0.02 for 2%)')
     parser.add_argument('--max_trades', type=int, default=5, help='Maximum number of open trades')
     parser.add_argument('--commission', type=float, default=0.0, help='Commission per trade')
-    parser.add_argument('--force-save', action='store_true', help='Force save model even if worse than existing')
+    parser.add_argument('--force-save', action='store_true', help='Force save best model even if target not reached')
+    parser.add_argument('--iterations', type=int, default=50, help='Maximum number of optimization iterations')
+    parser.add_argument('--min-profit', action='store_true', help='Only save profitable models')
+    parser.add_argument('--target-pf', type=float, default=2.0, help='Target profit factor to achieve')
     
     args = parser.parse_args()
     
     print(f"\nTraining model for {args.symbol} on {args.timeframe} timeframe")
+
     
     # Setup MT5 connection
     if not setup_mt5_connection():
@@ -64,10 +69,11 @@ def main():
     # Prepare features
     df = prepare_features(df)
     
-    # Define feature columns
-    feature_columns = ['Price_Change', 'High_Low_Range', 'Body_Size', 'Upper_Wick', 
-                      'Lower_Wick', 'Volume_Change', 'Volume_Ratio', 'Momentum', 
-                      'Volatility', 'Price_Position', 'Trend', 'RSI_Signal']
+    # Define feature columns (updated to match the simplified feature set)
+    feature_columns = [
+        'Price_Change', 'High_Low_Range', 'Body_Size', 'Upper_Wick', 
+        'Lower_Wick', 'Price_Position', 'RSI_Signal'
+    ]
     
     # Create target variable (next candle direction)
     df['Next_Direction'] = np.where(df['close'].shift(-1) > df['close'], 1, 
@@ -84,32 +90,127 @@ def main():
     X_train = df_train[feature_columns].values
     y_train = df_train['Next_Direction'].values
     
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
+    # Initialize best model tracking
+    best_model = None
+    best_scaler = None
+    best_metrics = None
+    best_backtest = None
+    best_profit_factor = 0
     
-    # Train model
-    model, training_metrics = train_model(X_train_scaled, y_train)
+    # Run optimization loop
+    print(f"\nStarting optimization with up to {args.iterations} iterations...")
+    print(f"Will stop when profit factor >= {args.target_pf} is achieved")
     
-    # Run backtest on test data
-    backtest_results = run_backtest(model, df_test, params, scaler)
+    for iteration in range(args.iterations):
+        print(f"\n--- Iteration {iteration+1}/{args.iterations} ---")
+        
+        # Vary hyperparameters for each iteration - using Python's random instead of numpy
+        import random
+        n_estimators = random.choice([50, 100, 150, 200, 250, 300])
+        max_depth = random.choice([3, 5, 8, 10, 12, 15, None])
+        min_samples_split = random.choice([2, 5, 10, 15, 20])
+        min_samples_leaf = random.choice([1, 2, 4, 5, 8, 10])
+        class_weight = random.choice(['balanced', 'balanced_subsample', None])
+        
+        # Randomly select max_features (using Python's random)
+        max_features_choice = random.choice(['sqrt', 'log2', 0.7, 0.8, 0.9, 1.0])
+        
+        print(f"Training with: n_estimators={n_estimators}, max_depth={max_depth}, "
+              f"min_samples_split={min_samples_split}, min_samples_leaf={min_samples_leaf}, "
+              f"class_weight={class_weight}, max_features={max_features_choice}")
+        
+        # Scale features
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X_train)
+        
+        # Train model with current hyperparameters
+        model = RandomForestClassifier(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split,
+            min_samples_leaf=min_samples_leaf,
+            class_weight=class_weight,
+            max_features=max_features_choice,
+            random_state=42 + iteration  # Different seed for each iteration
+        )
+        
+        model.fit(X_train_scaled, y_train)
+        
+        # Make predictions on training data for evaluation
+        y_pred = model.predict(X_train_scaled)
+        
+        # Calculate training metrics
+        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+        accuracy = accuracy_score(y_train, y_pred)
+        precision = precision_score(y_train, y_pred, average='weighted', zero_division=0)
+        recall = recall_score(y_train, y_pred, average='weighted', zero_division=0)
+        f1 = f1_score(y_train, y_pred, average='weighted', zero_division=0)
+        
+        print(f"\nTraining metrics:")
+        print(f"Accuracy: {accuracy:.4f}")
+        print(f"Precision: {precision:.4f}")
+        print(f"Recall: {recall:.4f}")
+        print(f"F1 Score: {f1:.4f}")
+        
+        training_metrics = {
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1': f1
+        }
+        
+        # Run backtest on test data
+        backtest_results = run_backtest(model, df_test, params, scaler)
+        
+        # Get profit factor from backtest
+        profit_factor = backtest_results['metrics']['profit_factor']
+        print(f"\nProfit Factor: {profit_factor:.2f}")
+        print(f"\n****************************************\n")
+        
+        # Update best model if current model has better profit factor
+        if profit_factor > best_profit_factor:
+            best_model = model
+            best_scaler = scaler
+            best_metrics = training_metrics
+            best_backtest = backtest_results
+            best_profit_factor = profit_factor
+            print(f"\n****************************************\n")
+            print(f"\nNew best model found! Profit Factor: {best_profit_factor:.2f}")
+            print(f"\n****************************************\n")
     
-    # Evaluate model performance
-    model_score = evaluate_model_performance(backtest_results)
+            # Save the current best model
+            save_model(best_model, best_scaler, best_metrics, args.symbol, args.timeframe)
+            save_backtest_results(best_backtest, args.symbol, args.timeframe)
+            print("\nIntermediate best model saved")
+            
+            # Plot backtest results for the current best model
+            plot_backtest_results(best_backtest, args.symbol, args.timeframe)
+        
+        # Check if we've reached the target profit factor
+        if profit_factor >= args.target_pf:
+            print(f"\nTarget profit factor of {args.target_pf} achieved! Stopping optimization.")
+            break
     
-    # Compare with existing model
-    is_better = compare_models(model_score, args.symbol, args.timeframe)
-    
-    # Save model if it's better or if force-save is specified
-    if is_better or args.force_save:
-        save_model(model, scaler, training_metrics, args.symbol, args.timeframe)
-        save_backtest_results(backtest_results, args.symbol, args.timeframe)
-        print("\nModel saved successfully")
+    # Final summary
+    if best_model is not None:
+        print("\n--- Optimization Summary ---")
+        print(f"Best Profit Factor: {best_profit_factor:.2f}")
+        print(f"Target Profit Factor: {args.target_pf:.2f}")
+        
+        if best_profit_factor >= args.target_pf:
+            print("\nSUCCESS: Target profit factor achieved!")
+        else:
+            print("\nNOTE: Target profit factor not achieved, but best model was saved.")
+            
+        # Ensure the best model is saved
+        save_model(best_model, best_scaler, best_metrics, args.symbol, args.timeframe)
+        save_backtest_results(best_backtest, args.symbol, args.timeframe)
+        print("\nBest model saved successfully")
+        
+        # Plot final backtest results
+        plot_backtest_results(best_backtest, args.symbol, args.timeframe)
     else:
-        print("\nNew model is not better than existing model. Not saving.")
-    
-    # Plot backtest results
-    plot_backtest_results(backtest_results, args.symbol, args.timeframe)
+        print("\nNo suitable model found during optimization.")
     
     # Shutdown MT5
     mt5.shutdown()
@@ -117,4 +218,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

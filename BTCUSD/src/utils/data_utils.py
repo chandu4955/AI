@@ -1,4 +1,4 @@
-# Updated data_utils.py
+# Updated data_utils.py with no trend indicators
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
@@ -50,8 +50,9 @@ def get_historical_data(symbol, timeframe, start_date, end_date):
 
 def prepare_features(df):
     """
-    Prepare features for the model.
-    This function is used consistently across training, backtesting, and live trading.
+    Prepare simplified features for the model.
+    Removed: volume, momentum, volatility, and ALL trend indicators.
+    Only keeping price action and RSI indicators.
     
     Args:
         df: DataFrame with historical data
@@ -66,25 +67,8 @@ def prepare_features(df):
     df['Upper_Wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
     df['Lower_Wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
     
-    # Calculate volume-based features
-    df['Volume_Change'] = df['tick_volume'].pct_change()
-    df['Volume_MA'] = df['tick_volume'].rolling(window=5).mean()
-    df['Volume_Ratio'] = df['tick_volume'] / df['Volume_MA']
-    
-    # Calculate momentum and volatility
-    df['Momentum'] = df['Price_Change'].rolling(window=3).sum()
-    df['Volatility'] = df['Price_Change'].rolling(window=5).std()
-    
     # Calculate price position
     df['Price_Position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
-    
-    # Calculate trend indicators
-    df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
-    df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-    df['Trend'] = np.where(
-        (df['EMA20'] > df['EMA50']) & (df['close'] > df['EMA20']), 1,
-        np.where((df['EMA20'] < df['EMA50']) & (df['close'] < df['EMA20']), -1, 0)
-    )
     
     # Calculate RSI
     delta = df['close'].diff()
