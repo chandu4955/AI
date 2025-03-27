@@ -1,79 +1,22 @@
+# Updated train.py
 import argparse
 import os
-import sys
-import json
-from datetime import datetime
+import pickle
+import numpy as np
+import pandas as pd
+import MetaTrader5 as mt5
+from datetime import datetime, timedelta
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
 
-# Add the src directory to the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from utils.data_utils import load_mt5_history, prepare_features
-from utils.model_utils import train_model, save_model
-from utils.backtest_utils import run_backtest, save_backtest_results
-from utils.trading_utils import TradingParameters
-
-def load_backtest_metrics(symbol, timeframe):
-    """Load backtest metrics for an existing model."""
-    metrics_path = os.path.join('models', f'{symbol}_{timeframe}_backtest_metrics.json')
-    if not os.path.exists(metrics_path):
-        return None
-    
-    try:
-        with open(metrics_path, 'r') as f:
-            metrics = json.load(f)
-        return metrics
-    except Exception as e:
-        print(f"Error loading backtest metrics: {str(e)}")
-        return None
-
-def save_backtest_metrics(metrics, symbol, timeframe):
-    """Save backtest metrics to a file."""
-    metrics_path = os.path.join('models', f'{symbol}_{timeframe}_backtest_metrics.json')
-    
-    # Create models directory if it doesn't exist
-    os.makedirs('models', exist_ok=True)
-    
-    try:
-        with open(metrics_path, 'w') as f:
-            json.dump(metrics, f, indent=4)
-        print(f"Backtest metrics saved to {metrics_path}")
-    except Exception as e:
-        print(f"Error saving backtest metrics: {str(e)}")
-
-def compare_backtest_results(new_metrics, existing_metrics=None):
-    """Compare new backtest metrics with existing backtest metrics."""
-    if existing_metrics is None:
-        return True  # No existing metrics to compare with
-    
-    # Define weights for different metrics
-    weights = {
-        'return_pct': 0.4,
-        'win_rate': 0.2,
-        'profit_factor': 0.3,
-        'max_drawdown': -0.1  # Negative weight because lower is better
-    }
-    
-    # Calculate weighted score for each model
-    new_score = (
-        new_metrics['return_pct'] * weights['return_pct'] + 
-        new_metrics['win_rate'] * 100 * weights['win_rate'] + 
-        new_metrics['profit_factor'] * weights['profit_factor'] + 
-        new_metrics['max_drawdown'] * weights['max_drawdown']
-    )
-    
-    existing_score = (
-        existing_metrics['return_pct'] * weights['return_pct'] + 
-        existing_metrics['win_rate'] * 100 * weights['win_rate'] + 
-        existing_metrics['profit_factor'] * weights['profit_factor'] + 
-        existing_metrics['max_drawdown'] * weights['max_drawdown']
-    )
-    
-    # Return True if new model is better
-    return new_score > existing_score
+from utils.data_utils import get_historical_data, prepare_features
+from utils.model_utils import train_model, save_model, load_model, evaluate_model_performance, compare_models, save_backtest_results
+from utils.backtest_utils import run_backtest, plot_backtest_results
+from utils.trading_utils import TradingParameters, setup_mt5_connection
 
 def main():
     parser = argparse.ArgumentParser(description='Train a trading model')
-    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., EURUSD)')
+    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., BTCUSD)')
     parser.add_argument('--timeframe', type=str, default='M15', help='Timeframe (M1, M5, M15, H1, D1)')
     parser.add_argument('--days', type=int, default=60, help='Number of days of historical data to use')
     parser.add_argument('--lotsize', type=float, default=0.01, help='Lot size for trading')
@@ -87,28 +30,13 @@ def main():
     args = parser.parse_args()
     
     print(f"\nTraining model for {args.symbol} on {args.timeframe} timeframe")
-    print(f"Using {args.days} days of historical data")
     
-    # Load historical data
-    df = load_mt5_history(args.symbol, args.timeframe, args.days)
-    if df is None:
-        print("\nFailed to load historical data. Exiting.")
+    # Setup MT5 connection
+    if not setup_mt5_connection():
+        print("\nFailed to connect to MT5. Exiting.")
         return
     
-    print(f"\nLoaded {len(df)} candles of historical data")
-    
-    # Prepare features
-    df_features = prepare_features(df, args.timeframe)
-    if df_features is None:
-        print("\nFailed to prepare features. Exiting.")
-        return
-    
-    print(f"\nPrepared features for {len(df_features)} candles")
-    
-    # Train model
-    model, valid_indices, scaler, train_metrics = train_model(df_features)
-    
-    # Run backtest on the trained model
+    # Set up trading parameters
     params = TradingParameters(
         symbol=args.symbol,
         timeframe=args.timeframe,
@@ -120,34 +48,73 @@ def main():
         commission=args.commission
     )
     
-    backtest_results = run_backtest(model, df_features, params, scaler, valid_indices)
+    # Get historical data
+    print(f"\nFetching {args.days} days of historical data...")
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=args.days)
     
-    # Save backtest results to file for reference
-    results_file = save_backtest_results(backtest_results, args.symbol, args.timeframe, args.capital)
+    df = get_historical_data(args.symbol, args.timeframe, start_date, end_date)
+    if df is None or len(df) == 0:
+        print("\nFailed to get historical data. Exiting.")
+        mt5.shutdown()
+        return
     
-    # Check existing backtest metrics
-    existing_backtest_metrics = load_backtest_metrics(args.symbol, args.timeframe)
+    print(f"\nGot {len(df)} candles of historical data")
     
-    if existing_backtest_metrics:
-        print("\nExisting model backtest metrics:")
-        print(f"Return: {existing_backtest_metrics['return_pct']:.2f}%")
-        print(f"Win Rate: {existing_backtest_metrics['win_rate']:.2%}")
-        print(f"Profit Factor: {existing_backtest_metrics['profit_factor']:.2f}")
-        print(f"Max Drawdown: {existing_backtest_metrics['max_drawdown']:.2f}%")
+    # Prepare features
+    df = prepare_features(df)
     
-    # Compare new backtest results with existing
-    new_backtest_metrics = backtest_results['metrics']
-    should_save = args.force_save or compare_backtest_results(new_backtest_metrics, existing_backtest_metrics)
+    # Define feature columns
+    feature_columns = ['Price_Change', 'High_Low_Range', 'Body_Size', 'Upper_Wick', 
+                      'Lower_Wick', 'Volume_Change', 'Volume_Ratio', 'Momentum', 
+                      'Volatility', 'Price_Position', 'Trend', 'RSI_Signal']
     
-    if should_save:
-        print("\nNew model performs better in backtesting. Saving model...")
-        # Save model, scaler, and backtest metrics
-        save_model(model, scaler, train_metrics, args.symbol, args.timeframe, force_save=True)
-        save_backtest_metrics(new_backtest_metrics, args.symbol, args.timeframe)
+    # Create target variable (next candle direction)
+    df['Next_Direction'] = np.where(df['close'].shift(-1) > df['close'], 1, 
+                                   np.where(df['close'].shift(-1) < df['close'], -1, 0))
+    
+    # Drop rows with NaN values
+    df = df.dropna()
+    
+    # Split data into training and testing sets
+    train_size = int(len(df) * 0.8)
+    df_train = df.iloc[:train_size]
+    df_test = df.iloc[train_size:]
+    
+    X_train = df_train[feature_columns].values
+    y_train = df_train['Next_Direction'].values
+    
+    # Scale features
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    
+    # Train model
+    model, training_metrics = train_model(X_train_scaled, y_train)
+    
+    # Run backtest on test data
+    backtest_results = run_backtest(model, df_test, params, scaler)
+    
+    # Evaluate model performance
+    model_score = evaluate_model_performance(backtest_results)
+    
+    # Compare with existing model
+    is_better = compare_models(model_score, args.symbol, args.timeframe)
+    
+    # Save model if it's better or if force-save is specified
+    if is_better or args.force_save:
+        save_model(model, scaler, training_metrics, args.symbol, args.timeframe)
+        save_backtest_results(backtest_results, args.symbol, args.timeframe)
+        print("\nModel saved successfully")
     else:
-        print("\nExisting model performs better in backtesting. New model will not be saved.")
+        print("\nNew model is not better than existing model. Not saving.")
     
-    print("\nTraining and backtesting completed successfully")
+    # Plot backtest results
+    plot_backtest_results(backtest_results, args.symbol, args.timeframe)
+    
+    # Shutdown MT5
+    mt5.shutdown()
+    print("\nTraining completed")
 
 if __name__ == "__main__":
     main()
+

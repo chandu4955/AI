@@ -1,19 +1,20 @@
+# Updated backtest.py
 import argparse
 import os
-import sys
-from datetime import datetime
+import pickle
+import numpy as np
+import pandas as pd
+import MetaTrader5 as mt5
+from datetime import datetime, timedelta
 
-# Add the src directory to the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from utils.data_utils import load_mt5_history, prepare_features
-from utils.model_utils import load_model
-from utils.backtest_utils import run_backtest, save_backtest_results
-from utils.trading_utils import TradingParameters
+from utils.data_utils import get_historical_data, prepare_features
+from utils.model_utils import load_model, save_backtest_results
+from utils.backtest_utils import run_backtest, plot_backtest_results
+from utils.trading_utils import TradingParameters, setup_mt5_connection
 
 def main():
     parser = argparse.ArgumentParser(description='Backtest a trained trading model')
-    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., EURUSD)')
+    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., BTCUSD)')
     parser.add_argument('--timeframe', type=str, default='M15', help='Timeframe (M1, M5, M15, H1, D1)')
     parser.add_argument('--days', type=int, default=30, help='Number of days of historical data to use')
     parser.add_argument('--lotsize', type=float, default=0.01, help='Lot size for trading')
@@ -26,7 +27,6 @@ def main():
     args = parser.parse_args()
     
     print(f"\nBacktesting model for {args.symbol} on {args.timeframe} timeframe")
-    print(f"Using {args.days} days of historical data")
     
     # Load the trained model
     model, scaler = load_model(args.symbol, args.timeframe)
@@ -34,21 +34,10 @@ def main():
         print("\nFailed to load model. Exiting.")
         return
     
-    # Load historical data
-    df = load_mt5_history(args.symbol, args.timeframe, args.days)
-    if df is None:
-        print("\nFailed to load historical data. Exiting.")
+    # Setup MT5 connection
+    if not setup_mt5_connection():
+        print("\nFailed to connect to MT5. Exiting.")
         return
-    
-    print(f"\nLoaded {len(df)} candles of historical data")
-    
-    # Prepare features
-    df_features = prepare_features(df, args.timeframe)
-    if df_features is None:
-        print("\nFailed to prepare features. Exiting.")
-        return
-    
-    print(f"\nPrepared features for {len(df_features)} candles")
     
     # Set up trading parameters
     params = TradingParameters(
@@ -62,14 +51,34 @@ def main():
         commission=args.commission
     )
     
-    # Run backtest using the same methodology as in train.py
-    backtest_results = run_backtest(model, df_features, params, scaler)
+    # Get historical data
+    print(f"\nFetching {args.days} days of historical data...")
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=args.days)
+    
+    df = get_historical_data(args.symbol, args.timeframe, start_date, end_date)
+    if df is None or len(df) == 0:
+        print("\nFailed to get historical data. Exiting.")
+        mt5.shutdown()
+        return
+    
+    print(f"\nGot {len(df)} candles of historical data")
+    
+    # Prepare features
+    df = prepare_features(df)
+    
+    # Run backtest
+    backtest_results = run_backtest(model, df, params, scaler)
     
     # Save backtest results
-    results_file = save_backtest_results(backtest_results, args.symbol, args.timeframe, args.capital)
-    print(f"\nBacktest results saved to {results_file}")
+    save_backtest_results(backtest_results, args.symbol, args.timeframe)
     
-    print("\nBacktesting completed successfully")
+    # Plot backtest results
+    plot_backtest_results(backtest_results, args.symbol, args.timeframe)
+    
+    # Shutdown MT5
+    mt5.shutdown()
+    print("\nBacktest completed")
 
 if __name__ == "__main__":
     main()

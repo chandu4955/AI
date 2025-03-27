@@ -1,9 +1,10 @@
+# Updated trading_utils.py
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
 import time
 import logging
+from datetime import datetime
 
 class TradingParameters:
     def __init__(self, symbol, timeframe, lotsize=0.01, spread=1.0, capital=10000.0, 
@@ -17,26 +18,34 @@ class TradingParameters:
         self.max_trades = max_trades
         self.commission = commission
 
-
 def setup_mt5_connection():
     """Initialize connection to MetaTrader 5."""
     if not mt5.initialize():
         print("\nFailed to initialize MT5")
-        print(f"Error: {mt5.last_error()}")
         return False
     
-    print("\nMT5 initialized successfully")
-    account_info = mt5.account_info()
-    if account_info:
-        print(f"Connected to account #{account_info.login} {account_info.server}")
-        print(f"Balance: ${account_info.balance:.2f}, Equity: ${account_info.equity:.2f}")
-        return True
-    else:
-        print("\nFailed to get account info")
+    # Check if connected
+    if not mt5.terminal_info().connected:
+        print("\nNot connected to MT5 terminal")
         return False
+    
+    print("\nConnected to MT5 terminal")
+    return True
 
-def place_market_order(symbol, order_type, volume, sl=0.0, tp=0.0, comment=""):
-    """Place a market order in MT5."""
+def get_open_positions(symbol=None):
+    """Get all open positions, optionally filtered by symbol."""
+    if not mt5.initialize():
+        print("\nFailed to initialize MT5")
+        return []
+    
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        return []
+    
+    return positions
+
+def place_market_order(symbol, order_type, volume, comment=""):
+    """Place a market order in MT5 without SL/TP."""
     if not mt5.initialize():
         print("\nFailed to initialize MT5")
         return None
@@ -62,8 +71,6 @@ def place_market_order(symbol, order_type, volume, sl=0.0, tp=0.0, comment=""):
         "volume": float(volume),
         "type": order_type,
         "price": price,
-        "sl": sl,
-        "tp": tp,
         "deviation": 10,
         "magic": 234000,
         "comment": comment,
@@ -82,33 +89,28 @@ def place_market_order(symbol, order_type, volume, sl=0.0, tp=0.0, comment=""):
     print(f"\nOrder placed successfully: {result.order}")
     return result.order
 
-def close_position(position_id):
-    """Close a specific position by its ticket ID."""
+def close_position(ticket):
+    """Close a specific position by ticket number."""
     if not mt5.initialize():
         print("\nFailed to initialize MT5")
         return False
     
-    # Get the position details
-    position = mt5.positions_get(ticket=position_id)
-    if not position:
-        print(f"\nPosition {position_id} not found")
+    # Get position info
+    positions = mt5.positions_get(ticket=ticket)
+    if positions is None or len(positions) == 0:
+        print(f"\nPosition {ticket} not found")
         return False
     
-    position = position[0]
-    
-    # Determine the order type for closing
-    close_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+    position = positions[0]
     
     # Prepare the request
-    price = mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask
-    
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": position.symbol,
         "volume": position.volume,
-        "type": close_type,
-        "position": position_id,
-        "price": price,
+        "type": mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+        "position": ticket,
+        "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
         "deviation": 10,
         "magic": 234000,
         "comment": "Close position",
@@ -120,31 +122,14 @@ def close_position(position_id):
     result = mt5.order_send(request)
     
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"\nFailed to close position: {result.retcode}")
+        print(f"\nFailed to close position {ticket}: {result.retcode}")
         print(f"Error: {result.comment}")
         return False
     
-    print(f"\nPosition {position_id} closed successfully")
+    print(f"\nPosition {ticket} closed successfully")
     return True
 
-def get_open_positions(symbol=None):
-    """Get all open positions, optionally filtered by symbol."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return []
-    
-    if symbol:
-        positions = mt5.positions_get(symbol=symbol)
-    else:
-        positions = mt5.positions_get()
-    
-    if positions is None:
-        print("\nNo positions found")
-        return []
-    
-    return positions
-
-def calculate_position_size(account_balance, risk_percent, stop_loss_pips, symbol):
+def calculate_position_size(account_balance, risk_percent, symbol):
     """Calculate position size based on risk management."""
     if not mt5.initialize():
         print("\nFailed to initialize MT5")
@@ -159,12 +144,15 @@ def calculate_position_size(account_balance, risk_percent, stop_loss_pips, symbo
     # Calculate risk amount
     risk_amount = account_balance * risk_percent
     
-    # Get pip value
-    pip_value = symbol_info.trade_tick_value
+    # Get current price
+    current_price = mt5.symbol_info_tick(symbol).ask
     
-    # Calculate position size
-    if stop_loss_pips > 0 and pip_value > 0:
-        position_size = risk_amount / (stop_loss_pips * pip_value)
+    # Calculate position size based on 1% price movement risk
+    # This is a simplified approach - adjust based on your risk model
+    price_risk = current_price * 0.01  # 1% price movement
+    
+    if price_risk > 0:
+        position_size = risk_amount / price_risk
     else:
         position_size = 0.01  # Default minimum
     
@@ -183,194 +171,157 @@ def calculate_position_size(account_balance, risk_percent, stop_loss_pips, symbo
     
     return position_size
 
-def run_live_trading(model, scaler, params, feature_columns):
-    """Run live trading with the given model and parameters."""
-    if not setup_mt5_connection():
-        print("\nFailed to connect to MT5. Exiting.")
-        return
+def execute_trade_decision(prediction, params, positions, current_price, current_time, is_live=False):
+    """
+    Execute a trade decision based on model prediction.
+    This function is used consistently across backtesting and live trading.
     
-    print(f"\nStarting live trading for {params.symbol} on {params.timeframe} timeframe")
-    print(f"Using lot size: {params.lotsize}")
-    print(f"Maximum open trades: {params.max_trades}")
+    Args:
+        prediction: Model prediction (1=buy, -1=sell, 0=hold)
+        params: TradingParameters object
+        positions: List of current open positions
+        current_price: Current market price
+        current_time: Current timestamp
+        is_live: Boolean indicating if this is live trading
+        
+    Returns:
+        new_positions: List of new positions opened
+        closed_positions: List of positions closed
+    """
+    new_positions = []
+    closed_positions = []
     
-    # Setup logging
-    logging.basicConfig(
-        filename=f"trading_{params.symbol}_{params.timeframe}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log",
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    logging.info(f"Starting live trading for {params.symbol} on {params.timeframe}")
-    
-    timeframe_map = {
-        'M1': mt5.TIMEFRAME_M1,
-        'M5': mt5.TIMEFRAME_M5,
-        'M15': mt5.TIMEFRAME_M15,
-        'H1': mt5.TIMEFRAME_H1,
-        'D1': mt5.TIMEFRAME_D1
-    }
-    
-    mt5_timeframe = timeframe_map.get(params.timeframe)
-    if mt5_timeframe is None:
-        print(f"\nInvalid timeframe: {params.timeframe}")
-        return
-    
-    try:
-        while True:
-            # Get current open positions
-            positions = get_open_positions(params.symbol)
-            
-            # Get latest data
-            rates = mt5.copy_rates_from_pos(params.symbol, mt5_timeframe, 0, 100)
-            if rates is None:
-                print("\nFailed to get market data. Retrying...")
-                time.sleep(5)
-                continue
-            
-            df = pd.DataFrame(rates)
-            df['time'] = pd.to_datetime(df['time'], unit='s')
-            
-            # Prepare features
-            df['Price_Change'] = df['close'].pct_change()
-            df['High_Low_Range'] = (df['high'] - df['low']) / df['close']
-            df['Body_Size'] = abs(df['close'] - df['open']) / df['close']
-            df['Upper_Wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
-            df['Lower_Wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
-            df['Volume_Change'] = df['tick_volume'].pct_change()
-            df['Volume_MA'] = df['tick_volume'].rolling(window=5).mean()
-            df['Volume_Ratio'] = df['tick_volume'] / df['Volume_MA']
-            df['Momentum'] = df['Price_Change'].rolling(window=3).sum()
-            df['Volatility'] = df['Price_Change'].rolling(window=5).std()
-            df['Price_Position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
-            df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
-            df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-            df['RSI'] = 100 - (100 / (1 + (df['close'].diff().clip(lower=0).rolling(14).mean() / 
-                                          df['close'].diff().clip(upper=0).abs().rolling(14).mean())))
-            df['RSI_Signal'] = np.where(df['RSI'] < 30, 1, np.where(df['RSI'] > 70, -1, 0))
-            df['Trend'] = np.where(
-                (df['EMA20'] > df['EMA50']) & (df['close'] > df['EMA20']), 1,
-                np.where((df['EMA20'] < df['EMA50']) & (df['close'] < df['EMA20']), -1, 0)
-            )
-            
-            # Drop NaN values
-            df = df.dropna()
-            
-            if len(df) < 2:
-                print("\nNot enough data points after feature calculation")
-                time.sleep(5)
-                continue
-            
-            # Get the latest completed candle
-            latest_candle = df.iloc[-2]
-            features = latest_candle[feature_columns].values.reshape(1, -1)
-            
-            # Scale features and predict
-            features_scaled = scaler.transform(features)
-            prediction = model.predict(features_scaled)[0]
-            
-            current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            print(f"\n[{current_time}] Latest candle time: {latest_candle['time']}")
-            print(f"Current price: {latest_candle['close']}")
-            print(f"Prediction: {prediction} (1=Buy, -1=Sell, 0=Hold)")
-            
-            # Check if we can open new positions
-            if len(positions) < params.max_trades:
-                if prediction == 1:  # Buy signal
-                    # Calculate position size based on risk management
-                    account_info = mt5.account_info()
-                    if account_info:
-                        position_size = calculate_position_size(
-                            account_info.balance, 
-                            params.risk_per_trade,
-                            params.stop_loss_pips,
-                            params.symbol
-                        )
-                    else:
-                        position_size = params.lotsize
-                    
-                    # Calculate stop loss and take profit levels
-                    current_price = mt5.symbol_info_tick(params.symbol).ask
-                    stop_loss = current_price - (params.stop_loss_pips * mt5.symbol_info(params.symbol).point)
-                    take_profit = current_price + (params.take_profit_pips * mt5.symbol_info(params.symbol).point)
-                    
-                    # Place buy order
-                    order_id = place_market_order(
-                        params.symbol,
-                        mt5.ORDER_TYPE_BUY,
-                        position_size,
-                        sl=stop_loss,
-                        tp=take_profit,
-                        comment=f"ML Signal {current_time}"
+    # Check if we can open new positions
+    if len(positions) < params.max_trades:
+        if prediction == 1:  # Buy signal
+            # Calculate position size
+            if is_live:
+                account_info = mt5.account_info()
+                if account_info:
+                    position_size = calculate_position_size(
+                        account_info.balance, 
+                        params.risk_per_trade,
+                        params.symbol
                     )
-                    
-                    if order_id:
-                        logging.info(f"BUY order placed: {order_id}, Size: {position_size}, Price: {current_price}")
-                        print(f"\nBUY order placed: {order_id}, Size: {position_size}, Price: {current_price}")
+                else:
+                    position_size = params.lotsize
+            else:
+                position_size = params.lotsize
+            
+            # Open buy position
+            if is_live:
+                order_id = place_market_order(
+                    params.symbol,
+                    mt5.ORDER_TYPE_BUY,
+                    position_size,
+                    comment=f"ML Signal {current_time}"
+                )
                 
-                elif prediction == -1:  # Sell signal
-                    # Calculate position size based on risk management
-                    account_info = mt5.account_info()
-                    if account_info:
-                        position_size = calculate_position_size(
-                            account_info.balance, 
-                            params.risk_per_trade,
-                            params.stop_loss_pips,
-                            params.symbol
-                        )
-                    else:
-                        position_size = params.lotsize
-                    
-                    # Calculate stop loss and take profit levels
-                    # Calculate stop loss and take profit levels
-                    current_price = mt5.symbol_info_tick(params.symbol).bid
-                    stop_loss = current_price + (params.stop_loss_pips * mt5.symbol_info(params.symbol).point)
-                    take_profit = current_price - (params.take_profit_pips * mt5.symbol_info(params.symbol).point)
-                    
-                    # Place sell order
-                    order_id = place_market_order(
-                        params.symbol,
-                        mt5.ORDER_TYPE_SELL,
-                        position_size,
-                        sl=stop_loss,
-                        tp=take_profit,
-                        comment=f"ML Signal {current_time}"
+                if order_id:
+                    new_position = {
+                        'ticket': order_id,
+                        'type': 'buy',
+                        'entry_price': current_price + params.spread,
+                        'entry_time': current_time,
+                        'size': position_size
+                    }
+                    new_positions.append(new_position)
+            else:
+                # For backtesting
+                new_position = {
+                    'type': 'buy',
+                    'entry_price': current_price + params.spread,
+                    'entry_time': current_time,
+                    'size': position_size
+                }
+                new_positions.append(new_position)
+            
+        elif prediction == -1:  # Sell signal
+            # Calculate position size
+            if is_live:
+                account_info = mt5.account_info()
+                if account_info:
+                    position_size = calculate_position_size(
+                        account_info.balance, 
+                        params.risk_per_trade,
+                        params.symbol
                     )
-                    
-                    if order_id:
-                        logging.info(f"SELL order placed: {order_id}, Size: {position_size}, Price: {current_price}")
-                        print(f"\nSELL order placed: {order_id}, Size: {position_size}, Price: {current_price}")
+                else:
+                    position_size = params.lotsize
+            else:
+                position_size = params.lotsize
             
-            # Check if we need to close any positions
-            for position in positions:
-                position_type = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
+            # Open sell position
+            if is_live:
+                order_id = place_market_order(
+                    params.symbol,
+                    mt5.ORDER_TYPE_SELL,
+                    position_size,
+                    comment=f"ML Signal {current_time}"
+                )
                 
-                # Close position if signal is opposite to current position
-                if (position_type == "BUY" and prediction == -1) or (position_type == "SELL" and prediction == 1):
-                    if close_position(position.ticket):
-                        logging.info(f"Closed {position_type} position: {position.ticket}, Profit: {position.profit}")
-                        print(f"\nClosed {position_type} position: {position.ticket}, Profit: {position.profit}")
-            
-            # Wait for next candle
-            minutes_to_wait = 1  # Default for M1
-            if params.timeframe == 'M5':
-                minutes_to_wait = 5
-            elif params.timeframe == 'M15':
-                minutes_to_wait = 15
-            elif params.timeframe == 'H1':
-                minutes_to_wait = 60
-            elif params.timeframe == 'D1':
-                minutes_to_wait = 1440
-            
-            print(f"\nWaiting {minutes_to_wait} minutes for next candle...")
-            time.sleep(minutes_to_wait * 60)
-            
-    except KeyboardInterrupt:
-        print("\nTrading stopped by user")
-        logging.info("Trading stopped by user")
-    except Exception as e:
-        print(f"\nError in trading loop: {str(e)}")
-        logging.error(f"Error in trading loop: {str(e)}")
-        raise
-    finally:
-        print("\nClosing MT5 connection")
-        mt5.shutdown()
+                if order_id:
+                    new_position = {
+                        'ticket': order_id,
+                        'type': 'sell',
+                        'entry_price': current_price,
+                        'entry_time': current_time,
+                        'size': position_size
+                    }
+                    new_positions.append(new_position)
+            else:
+                # For backtesting
+                new_position = {
+                    'type': 'sell',
+                    'entry_price': current_price,
+                    'entry_time': current_time,
+                    'size': position_size
+                }
+                new_positions.append(new_position)
+    
+    # Check if we need to close any positions based on model prediction
+    for position in positions:
+        if is_live:
+            position_type = "buy" if position.type == mt5.ORDER_TYPE_BUY else "sell"
+            position_ticket = position.ticket
+            position_profit = position.profit
+            position_volume = position.volume
+            position_price_open = position.price_open
+            position_time = pd.to_datetime(position.time, unit='s')
+        else:
+            position_type = position['type']
+            position_ticket = position.get('ticket', None)
+            position_profit = position.get('profit', 0)
+            position_volume = position['size']
+            position_price_open = position['entry_price']
+            position_time = position['entry_time']
+        
+        # Close position if signal is opposite to current position
+        if (position_type == "buy" and prediction == -1) or (position_type == "sell" and prediction == 1):
+            if is_live:
+                if close_position(position_ticket):
+                    closed_position = {
+                        'ticket': position_ticket,
+                        'type': position_type,
+                        'entry_price': position_price_open,
+                        'entry_time': position_time,
+                        'exit_price': current_price,
+                        'exit_time': current_time,
+                        'size': position_volume,
+                        'profit': position_profit
+                    }
+                    closed_positions.append(closed_position)
+            else:
+                # For backtesting
+                if position_type == "buy":
+                    profit = (current_price - position['entry_price']) * position['size'] - params.spread
+                else:
+                    profit = (position['entry_price'] - current_price) * position['size'] - params.spread
+                
+                closed_position = position.copy()
+                closed_position['exit_price'] = current_price
+                closed_position['exit_time'] = current_time
+                closed_position['profit'] = profit
+                closed_positions.append(closed_position)
+    
+    return new_positions, closed_positions

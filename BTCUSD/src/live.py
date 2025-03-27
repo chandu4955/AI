@@ -1,24 +1,20 @@
+# Updated live.py
 import argparse
 import os
-import sys
 import time
 import logging
-from datetime import datetime
-
-# Add the src directory to the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-import MetaTrader5 as mt5
-import pandas as pd
 import numpy as np
+import pandas as pd
+import MetaTrader5 as mt5
+from datetime import datetime, timedelta
 
+from utils.data_utils import get_historical_data, prepare_features
 from utils.model_utils import load_model, predict_signal
-from utils.trading_utils import TradingParameters, setup_mt5_connection, get_open_positions
-from utils.trading_utils import place_market_order, close_position, calculate_position_size
+from utils.trading_utils import TradingParameters, setup_mt5_connection, get_open_positions, execute_trade_decision
 
 def main():
     parser = argparse.ArgumentParser(description='Run live trading with a trained model')
-    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., EURUSD)')
+    parser.add_argument('--symbol', type=str, required=True, help='Trading symbol (e.g., BTCUSD)')
     parser.add_argument('--timeframe', type=str, default='M15', help='Timeframe (M1, M5, M15, H1, D1)')
     parser.add_argument('--lotsize', type=float, default=0.01, help='Lot size for trading')
     parser.add_argument('--capital', type=float, default=10000.0, help='Initial capital')
@@ -94,30 +90,12 @@ def main():
             
             df = pd.DataFrame(rates)
             df['time'] = pd.to_datetime(df['time'], unit='s')
+            df.set_index('time', inplace=True)
             
             # Prepare features
-            df['Price_Change'] = df['close'].pct_change()
-            df['High_Low_Range'] = (df['high'] - df['low']) / df['close']
-            df['Body_Size'] = abs(df['close'] - df['open']) / df['close']
-            df['Upper_Wick'] = (df['high'] - df[['open', 'close']].max(axis=1)) / df['close']
-            df['Lower_Wick'] = (df[['open', 'close']].min(axis=1) - df['low']) / df['close']
-            df['Volume_Change'] = df['tick_volume'].pct_change()
-            df['Volume_MA'] = df['tick_volume'].rolling(window=5).mean()
-            df['Volume_Ratio'] = df['tick_volume'] / df['Volume_MA']
-            df['Momentum'] = df['Price_Change'].rolling(window=3).sum()
-            df['Volatility'] = df['Price_Change'].rolling(window=5).std()
-            df['Price_Position'] = (df['close'] - df['low']) / (df['high'] - df['low'])
-            df['EMA20'] = df['close'].ewm(span=20, adjust=False).mean()
-            df['EMA50'] = df['close'].ewm(span=50, adjust=False).mean()
-            df['RSI'] = 100 - (100 / (1 + (df['close'].diff().clip(lower=0).rolling(14).mean() / 
-                                          df['close'].diff().clip(upper=0).abs().rolling(14).mean())))
-            df['RSI_Signal'] = np.where(df['RSI'] < 30, 1, np.where(df['RSI'] > 70, -1, 0))
-            df['Trend'] = np.where(
-                (df['EMA20'] > df['EMA50']) & (df['close'] > df['EMA20']), 1,
-                np.where((df['EMA20'] < df['EMA50']) & (df['close'] < df['EMA20']), -1, 0)
-            )
+            df = prepare_features(df)
             
-            # Drop NaN values
+            # Drop rows with NaN values
             df = df.dropna()
             
             if len(df) < 2:
@@ -127,7 +105,8 @@ def main():
             
             # Get the latest COMPLETED candle (second to last row)
             latest_completed_candle = df.iloc[-2]
-            current_time = latest_completed_candle['time']
+            current_time = latest_completed_candle.name
+            current_price = latest_completed_candle['close']
             
             # Skip if we've already processed this candle
             if last_processed_time is not None and current_time <= last_processed_time:
@@ -154,235 +133,41 @@ def main():
             # Update last processed time
             last_processed_time = current_time
             
-            # Make prediction using the same method as in backtesting
+            # Make prediction using the consistent prediction function
             prediction = predict_signal(model, scaler, latest_completed_candle, feature_columns)
             
             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Latest completed candle time: {current_time}")
-            print(f"Current price: {latest_completed_candle['close']}")
+            print(f"Current price: {current_price}")
             print(f"Prediction: {prediction} (1=Buy, -1=Sell, 0=Hold)")
             
-            # Check if we can open new positions
-            if len(positions) < params.max_trades:
-                if prediction == 1:  # Buy signal
-                    # Calculate position size based on risk management
-                    account_info = mt5.account_info()
-                    if account_info:
-                        position_size = calculate_position_size(
-                            account_info.balance, 
-                            params.risk_per_trade,
-                            params.symbol
-                        )
-                    else:
-                        position_size = params.lotsize
-                    
-                    # Place buy order
-                    order_id = place_market_order(
-                        params.symbol,
-                        mt5.ORDER_TYPE_BUY,
-                        position_size,
-                        comment=f"ML Signal {current_time}"
-                    )
-                    
-                    if order_id:
-                        logging.info(f"BUY order placed: {order_id}, Size: {position_size}")
-                        print(f"\nBUY order placed: {order_id}, Size: {position_size}")
-                
-                elif prediction == -1:  # Sell signal
-                    # Calculate position size based on risk management
-                    account_info = mt5.account_info()
-                    if account_info:
-                        position_size = calculate_position_size(
-                            account_info.balance, 
-                            params.risk_per_trade,
-                            params.symbol
-                        )
-                    else:
-                        position_size = params.lotsize
-                    
-                    # Place sell order
-                    order_id = place_market_order(
-                        params.symbol,
-                        mt5.ORDER_TYPE_SELL,
-                        position_size,
-                        comment=f"ML Signal {current_time}"
-                    )
-                    
-                    if order_id:
-                        logging.info(f"SELL order placed: {order_id}, Size: {position_size}")
-                        print(f"\nSELL order placed: {order_id}, Size: {position_size}")
+            # Execute trade decision using the standardized function
+            new_positions, closed_positions = execute_trade_decision(
+                prediction, params, positions, current_price, current_time, is_live=True
+            )
             
-            # Check if we need to close any positions based on model prediction
-            for position in positions:
-                position_type = "BUY" if position.type == mt5.ORDER_TYPE_BUY else "SELL"
-                
-                # Close position if signal is opposite to current position
-import MetaTrader5 as mt5
-import pandas as pd
-import numpy as np
-import time
-import logging
-from datetime import datetime
+            # Log new positions
+            for pos in new_positions:
+                logging.info(f"New {pos['type'].upper()} position: Ticket {pos['ticket']}, Size: {pos['size']}")
+                print(f"\nNew {pos['type'].upper()} position: Ticket {pos['ticket']}, Size: {pos['size']}")
+            
+            # Log closed positions
+            for pos in closed_positions:
+                logging.info(f"Closed {pos['type'].upper()} position: Ticket {pos['ticket']}, Profit: {pos['profit']}")
+                print(f"\nClosed {pos['type'].upper()} position: Ticket {pos['ticket']}, Profit: {pos['profit']}")
+            
+            # Wait for a short time before checking again
+            time.sleep(10)
+            
+    except KeyboardInterrupt:
+        print("\nTrading stopped by user")
+        logging.info("Trading stopped by user")
+    except Exception as e:
+        print(f"\nError in trading loop: {str(e)}")
+        logging.error(f"Error in trading loop: {str(e)}")
+        raise
+    finally:
+        print("\nClosing MT5 connection")
+        mt5.shutdown()
 
-class TradingParameters:
-    def __init__(self, symbol, timeframe, lotsize, spread, capital, risk_per_trade=0.02, 
-                 max_trades=5):
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.lotsize = lotsize
-        self.spread = spread
-        self.capital = capital
-        self.risk_per_trade = risk_per_trade
-        self.max_trades = max_trades
-
-def setup_mt5_connection():
-    """Initialize connection to MetaTrader 5."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return False
-    
-    # Check if connected
-    if not mt5.terminal_info().connected:
-        print("\nNot connected to MT5 terminal")
-        return False
-    
-    print("\nConnected to MT5 terminal")
-    return True
-
-def get_open_positions(symbol=None):
-    """Get all open positions, optionally filtered by symbol."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return []
-    
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None:
-        return []
-    
-    return positions
-
-def place_market_order(symbol, order_type, volume, comment=""):
-    """Place a market order in MT5 without SL/TP."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return None
-    
-    # Get symbol info
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        print(f"\nSymbol {symbol} not found")
-        return None
-    
-    if not symbol_info.visible:
-        print(f"\nSymbol {symbol} is not visible, trying to switch on")
-        if not mt5.symbol_select(symbol, True):
-            print(f"\nFailed to select {symbol}")
-            return None
-    
-    # Prepare the request
-    price = mt5.symbol_info_tick(symbol).ask if order_type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(symbol).bid
-    
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(volume),
-        "type": order_type,
-        "price": price,
-        "deviation": 10,
-        "magic": 234000,
-        "comment": comment,
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    # Send the order
-    result = mt5.order_send(request)
-    
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"\nOrder failed: {result.retcode}")
-        print(f"Error: {result.comment}")
-        return None
-    
-    print(f"\nOrder placed successfully: {result.order}")
-    return result.order
-
-def close_position(ticket):
-    """Close a specific position by ticket number."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return False
-    
-    # Get position info
-    positions = mt5.positions_get(ticket=ticket)
-    if positions is None or len(positions) == 0:
-        print(f"\nPosition {ticket} not found")
-        return False
-    
-    position = positions[0]
-    
-    # Prepare the request
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": position.symbol,
-        "volume": position.volume,
-        "type": mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
-        "position": ticket,
-        "price": mt5.symbol_info_tick(position.symbol).bid if position.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(position.symbol).ask,
-        "deviation": 10,
-        "magic": 234000,
-        "comment": "Close position",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    
-    # Send the order
-    result = mt5.order_send(request)
-    
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        print(f"\nFailed to close position {ticket}: {result.retcode}")
-        print(f"Error: {result.comment}")
-        return False
-    
-    print(f"\nPosition {ticket} closed successfully")
-    return True
-
-def calculate_position_size(account_balance, risk_percent, symbol):
-    """Calculate position size based on risk management."""
-    if not mt5.initialize():
-        print("\nFailed to initialize MT5")
-        return 0.01  # Default minimum
-    
-    # Get symbol info
-    symbol_info = mt5.symbol_info(symbol)
-    if symbol_info is None:
-        print(f"\nSymbol {symbol} not found")
-        return 0.01
-    
-    # Calculate risk amount
-    risk_amount = account_balance * risk_percent
-    
-    # Get current price
-    current_price = mt5.symbol_info_tick(symbol).ask
-    
-    # Calculate position size based on 1% price movement risk
-    # This is a simplified approach - adjust based on your risk model
-    price_risk = current_price * 0.01  # 1% price movement
-    
-    if price_risk > 0:
-        position_size = risk_amount / price_risk
-    else:
-        position_size = 0.01  # Default minimum
-    
-    # Round to standard lot sizes
-    if position_size >= 1:
-        position_size = round(position_size)
-    elif position_size >= 0.1:
-        position_size = round(position_size * 10) / 10
-    else:
-        position_size = round(position_size * 100) / 100
-    
-    # Ensure minimum lot size
-    min_lot = symbol_info.volume_min
-    if position_size < min_lot:
-        position_size = min_lot
-    
-    return position_size
+if __name__ == "__main__":
+    main()
